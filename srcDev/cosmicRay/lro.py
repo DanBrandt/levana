@@ -1,7 +1,7 @@
 # Module for loading, processing, and visualizing LRO data (level 2 data from CRaTER in particular).
 
 #### Top-level imports ####
-import os, sys, pickle
+import os, sys, pickle, csv
 import numpy as np
 from datetime import datetime, timedelta
 import pooch, time
@@ -168,24 +168,50 @@ def displayCRaTER(dateStart, dateEnd):
     # Secondary Data:
     secondaryList = ['CRAT_L2_SEC_'+x+'_V01.TAB.gz' for x in dateArray_mod]
 
-    # Read in data from each day into a BIG data structure, saved to a .csv:
+    # Read in data from each day into a .csv (writing line by line):
     print('Aggregating CRaTER data for display...')
     time.sleep(1)
-    for i in tqdm(range(len(dateArray))):
-        # Grab primary files:
-        primaryDict = processCRaTER(primaryList[i], des='primary')#, override=True)
-        # Grab secondary files:
-        secondaryDict = processCRaTER(secondaryList[i], des='secondary')#, override=True)
+    # aggregatedDict = {
+    #     'All_Detection_Times': np.array([]),
+    #     'All_Detection_Alts': np.array([]),
+    #     'All_Detection_Lats': np.array([]),
+    #     'All_Detection_Lons': np.array([])
+    # }
+    with open(model_path+'/modelData_'+dateStart+'-'+dateEnd+'.csv', 'w') as modelFile:
+        writer = csv.writer(modelFile, delimiter=' ')
+        names = ['All_Detection_Times', 'All_Detection_Alts', 'All_Detection_Lats', 'All_Detection_Lons', 'D1_Meas', 'D2_Meas']
+        writer.writerow(names) #" ".join(map(str, names))+'\n')
+        for i in tqdm(range(len(dateArray))):
+            print('Day '+str(i+1)+': '+dateArray[i]+'...')
+            # Grab primary files:
+            primaryDict = processCRaTER(primaryList[i], des='primary') #, override=True)
+            # Grab secondary files:
+            secondaryDict = processCRaTER(secondaryList[i], des='secondary') #, override=True)
 
-        # Interpolate the times and locations in the secondary files to the same cadence as the primary files; geolocate the measurements in the primary files:
-        fname = model_path+'/'+dateArray_mod[i]+'_harmonized.pkl'
-        harmonizedDict = harmonizeCrater(primaryDict, secondaryDict, fname, override=True)
+            # Interpolate the times and locations in the secondary files to the same cadence as the primary files; geolocate the measurements in the primary files:
+            fname = model_path+'/'+dateArray_mod[i]+'_harmonized.pkl'
+            harmonizedDict = harmonizeCrater(primaryDict, secondaryDict, fname)#, override=True)
 
-        # Append the proton GCR flux into an ever-growing data structure:
+            # Append the proton GCR flux into an ever-growing data structure:
+            # aggregatedDict.update({'All_Detection_Times': np.concatenate(
+            #     (aggregatedDict['All_Detection_Times'], harmonizedDict['Detection_Times']))})
+            # aggregatedDict.update({'All_Detection_Times': np.concatenate(
+            #     (aggregatedDict['All_Detection_Alts'], harmonizedDict['Detection_Alts']))})
+            # aggregatedDict.update({'All_Detection_Lats': np.concatenate(
+            #     (aggregatedDict['All_Detection_Lats'], harmonizedDict['Detection_Lats']))})
+            # aggregatedDict.update({'All_Detection_Lons': np.concatenate(
+            #     (aggregatedDict['All_Detection_Lons'], harmonizedDict['Detection_Lons']))})
 
-        print()
+            # Write the new data to the .csv file:
+            for j in range(len(harmonizedDict['Detection_Times'])):
+                row_text = [str(harmonizedDict['Detection_Times'][j]), str(harmonizedDict['Detection_Alts'][j]),
+                            str(harmonizedDict['Detection_Lats'][j]), str(harmonizedDict['Detection_Lons'][j]),
+                            str(harmonizedDict['D1_Meas'][j]), str(harmonizedDict['D2_Meas'][j])]
+                writer.writerow(row_text)
 
-    ellipsis
+    # TODO: Visualize the aggregated data in Lunar Geographic Coordinates:
+
+    print('Model data available here: '+model_path+'/modelData_'+dateStart+'-'+dateEnd+'.csv')
 
 def harmonizeCrater(primDict, secondDict, fname, override=False):
     """
@@ -221,19 +247,39 @@ def harmonizeCrater(primDict, secondDict, fname, override=False):
         d1_dose = sum(d1_measurements[good_adu_d1_inds])
         d2_dose = sum(d2_measurements[good_adu_d2_inds])
         dos_cGy_day = (d1_dose + d2_dose) * 1e-19 * 100
-        detections = len(good_adu_d1_inds) + len(good_adu_d2_inds)
-        #
+        num_detections = len(good_adu_d1_inds) + len(good_adu_d2_inds)
+        # GCR Detections (geolocated)
+        all_good_adu_inds = np.concatenate((good_adu_d1_inds, good_adu_d2_inds))
+        all_good_adu_inds_unique = np.unique(all_good_adu_inds)
+        detection_times = np.asarray(primDict['Time'])[all_good_adu_inds_unique]
+        detection_alts = interp_alts[all_good_adu_inds_unique]
+        detection_lats = interp_lats[all_good_adu_inds_unique]
+        detection_lons = interp_lons[all_good_adu_inds_unique]
+        # It is strongly recommended to limit the amount of processed data that is saved. This makes I/O operations faster:
         harmonizedDict = {
-            'Time': interp_times_seconds,
-            'Altitude': interp_alts,
-            'Latitude': interp_lats,
-            'Longitude': interp_lons,
-            'Amplitude': primDict['Amplitude'],
-            'Energy': primDict['Energy'],
-            'LET': primDict['LET']
+            'Start_Time': secondDict['Time'][0],
+            'End_Time': secondDict['Time'][-1],
+            # 'Time': interp_times_seconds,
+            # 'Altitude': interp_alts,
+            # 'Latitude': interp_lats,
+            # 'Longitude': interp_lons,
+            # 'Amplitude': primDict['Amplitude'],
+            # 'Energy': primDict['Energy'],
+            # 'LET': primDict['LET'],
+            'Total_Dose': dos_cGy_day,
+            'Num_GCR_Detections': num_detections,
+            # 'd1_Detections': d1_measurements[good_adu_d1_inds],
+            # 'd2_Detections': d2_measurements[good_adu_d2_inds],
+            'Detection_Times': detection_times,
+            'Detection_Alts': detection_alts,
+            'Detection_Lats': detection_lats,
+            'Detection_Lons': detection_lons,
+            'D1_Meas': d1_measurements[all_good_adu_inds_unique],
+            'D2_Meas': d2_measurements[all_good_adu_inds_unique]
         }
         with open(fname, 'wb') as handle:
             pickle.dump(harmonizedDict, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        print('Data obtained.')
     else:
         with open(fname, 'rb') as handle:
             harmonizedDict = pickle.load(handle)
