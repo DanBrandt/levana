@@ -1,7 +1,7 @@
 # Module for loading, processing, and visualizing LRO data (level 2 data from CRaTER in particular).
 
 #### Top-level imports ####
-import os, sys, pickle, csv
+import os, pickle, csv
 import numpy as np
 from datetime import datetime, timedelta
 import pooch, time
@@ -11,6 +11,12 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Qt5Agg')
 from scipy.interpolate import InterpolatedUnivariateSpline
+import pandas as pd
+from lunarsky import MoonLocation
+import astropy.units as u
+from scipy.interpolate import griddata
+from PIL import Image
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 #### Local imports ####
 from srcDev.tools import toolbox
@@ -52,6 +58,7 @@ def getCRaTER(dateStart, dateEnd):
         current_CRaTER_file = 'CRAT_L2_SEC_' + dateArray_mod[i] + '_V01.TAB.gz'
         pooch.retrieve(url=url_list[i] + current_CRaTER_file, known_hash=None, fname=current_CRaTER_file,
                        path=download_path)
+        # TODO: RETRIEVE GEOMETRY FILES (LRO ephemeris data): https://crater-products.sr.unh.edu/data/sc/asflown/ephem_pntg/
 
     # Print, exit and return nothing:
     time.sleep(0.5)
@@ -78,13 +85,13 @@ def processCRaTER(filename, des='primary', override=False):
     with gzip.open(download_path+'/'+filename, 'r') as f:
         file_content = f.readlines()
 
-    # Read in the data:
+    # Read in the data: TODO: ADD A CONDITIONAL FOR READING GEOMETRY FILES
     if des=='primary':
         dictFile = process_path+'/'+filename[:-7] + '_primary.pkl'
         if os.path.isfile(dictFile) == False or override == True:
             timeVals = [] # UTC
-            amplitude = [] # Amplitude in Detectors D1 to D6
-            energy = [] # Energy deposited in Detectors D1 to D6
+            amplitude = [] # Amplitude in Detectors D1 to D6 (eV)
+            energy = [] # Energy deposited in Detectors D1 to D6 (eV)
             lineal_energy_transfer = [] # Lineal Energy Transfer in silicon in Detectors D1 to D6 (eV/microns)
             for line in file_content:
                 my_line = line.split(b',')
@@ -122,12 +129,12 @@ def processCRaTER(filename, des='primary', override=False):
                 my_line = line.split(b',')
                 #
                 timeVals.append(datetime.strptime(my_line[2].decode('utf-8'), '"%Y-%m-%dT%H:%M:%S"'))
-                #
-                altitude.append(float(my_line[-6].decode('utf-8')))
-                #
-                latitude.append(float(my_line[-2].decode('utf-8')))
-                #
-                longitude.append(float(my_line[-1].decode('utf-8')))
+                # Selenodetic Coordinates:
+                coords = MoonLocation.from_selenocentric(float(my_line[-3].decode('utf-8')), float(my_line[-2].decode('utf-8')), float(my_line[-1].decode('utf-8')), unit=u.km)
+                coords_sd = coords.to_selenodetic()
+                latitude.append(coords_sd.lon.value)
+                longitude.append(coords_sd.lat.value)
+                altitude.append(coords_sd.height.value)
             dataDict = {
                 'Time': timeVals,
                 'Altitude': altitude,
@@ -177,39 +184,103 @@ def displayCRaTER(dateStart, dateEnd):
     #     'All_Detection_Lats': np.array([]),
     #     'All_Detection_Lons': np.array([])
     # }
-    with open(model_path+'/modelData_'+dateStart+'-'+dateEnd+'.csv', 'w') as modelFile:
-        writer = csv.writer(modelFile, delimiter=' ')
-        names = ['All_Detection_Times', 'All_Detection_Alts', 'All_Detection_Lats', 'All_Detection_Lons', 'D1_Meas', 'D2_Meas']
-        writer.writerow(names) #" ".join(map(str, names))+'\n')
-        for i in tqdm(range(len(dateArray))):
-            print('Day '+str(i+1)+': '+dateArray[i]+'...')
-            # Grab primary files:
-            primaryDict = processCRaTER(primaryList[i], des='primary') #, override=True)
-            # Grab secondary files:
-            secondaryDict = processCRaTER(secondaryList[i], des='secondary') #, override=True)
+    csv_name = model_path+'/modelData_'+dateStart+'-'+dateEnd+'.csv'
+    # If the .csv file already exists, just open it and append to it. Otherwise, make a new one and write to it:
+    if os.path.isfile(csv_name) == True:
+        with open(csv_name, 'a') as modelFile:
+            writer = csv.writer(modelFile, delimiter=' ') # " ".join(map(str, names))+'\n')
+            for i in tqdm(range(len(dateArray))):
+                print('Day ' + str(i + 1) + ': ' + dateArray[i] + '...')
+                time.sleep(0.25)
+                # Grab primary files:
+                primaryDict = processCRaTER(primaryList[i], des='primary')  # , override=True)
+                # Grab secondary files:
+                secondaryDict = processCRaTER(secondaryList[i], des='secondary')  # , override=True)
 
-            # Interpolate the times and locations in the secondary files to the same cadence as the primary files; geolocate the measurements in the primary files:
-            fname = model_path+'/'+dateArray_mod[i]+'_harmonized.pkl'
-            harmonizedDict = harmonizeCrater(primaryDict, secondaryDict, fname)#, override=True)
+                # Interpolate the times and locations in the secondary files to the same cadence as the primary files; geolocate the measurements in the primary files:
+                fname = model_path + '/' + dateArray_mod[i] + '_harmonized.pkl'
+                harmonizedDict, pre_existing_data = harmonizeCrater(primaryDict, secondaryDict,
+                                                                    fname)  # , override=True)
 
-            # Append the proton GCR flux into an ever-growing data structure:
-            # aggregatedDict.update({'All_Detection_Times': np.concatenate(
-            #     (aggregatedDict['All_Detection_Times'], harmonizedDict['Detection_Times']))})
-            # aggregatedDict.update({'All_Detection_Times': np.concatenate(
-            #     (aggregatedDict['All_Detection_Alts'], harmonizedDict['Detection_Alts']))})
-            # aggregatedDict.update({'All_Detection_Lats': np.concatenate(
-            #     (aggregatedDict['All_Detection_Lats'], harmonizedDict['Detection_Lats']))})
-            # aggregatedDict.update({'All_Detection_Lons': np.concatenate(
-            #     (aggregatedDict['All_Detection_Lons'], harmonizedDict['Detection_Lons']))})
+                # Write the new data to the .csv file:
+                if pre_existing_data == False:
+                    for j in range(len(harmonizedDict['Detection_Times'])):
+                        row_text = [str(harmonizedDict['Detection_Times'][j]), str(harmonizedDict['Detection_Alts'][j]),
+                                    str(harmonizedDict['Detection_Lats'][j]), str(harmonizedDict['Detection_Lons'][j]),
+                                    str(harmonizedDict['D1_Meas'][j]), str(harmonizedDict['D2_Meas'][j])]
+                        writer.writerow(row_text)
+                else:
+                    print('This day has already been written to the .csv file; skipping...')
+    else:
+        with open(csv_name, 'w') as modelFile:
+            writer = csv.writer(modelFile, delimiter=' ')
+            names = ['All_Detection_Times', 'All_Detection_Alts', 'All_Detection_Lats', 'All_Detection_Lons', 'D1_Meas', 'D2_Meas']
+            writer.writerow(names) #" ".join(map(str, names))+'\n')
+            for i in tqdm(range(len(dateArray))):
+                print('Day '+str(i+1)+': '+dateArray[i]+'...')
+                time.sleep(0.25)
+                # Grab primary files:
+                primaryDict = processCRaTER(primaryList[i], des='primary') #, override=True)
+                # Grab secondary files:
+                secondaryDict = processCRaTER(secondaryList[i], des='secondary') #, override=True)
 
-            # Write the new data to the .csv file:
-            for j in range(len(harmonizedDict['Detection_Times'])):
-                row_text = [str(harmonizedDict['Detection_Times'][j]), str(harmonizedDict['Detection_Alts'][j]),
-                            str(harmonizedDict['Detection_Lats'][j]), str(harmonizedDict['Detection_Lons'][j]),
-                            str(harmonizedDict['D1_Meas'][j]), str(harmonizedDict['D2_Meas'][j])]
-                writer.writerow(row_text)
+                # Interpolate the times and locations in the secondary files to the same cadence as the primary files; geolocate the measurements in the primary files:
+                fname = model_path+'/'+dateArray_mod[i]+'_harmonized.pkl'
+                harmonizedDict, pre_existing_data = harmonizeCrater(primaryDict, secondaryDict, fname)#, override=True)
+
+                # Append the proton GCR flux into an ever-growing data structure:
+                # aggregatedDict.update({'All_Detection_Times': np.concatenate(
+                #     (aggregatedDict['All_Detection_Times'], harmonizedDict['Detection_Times']))})
+                # aggregatedDict.update({'All_Detection_Times': np.concatenate(
+                #     (aggregatedDict['All_Detection_Alts'], harmonizedDict['Detection_Alts']))})
+                # aggregatedDict.update({'All_Detection_Lats': np.concatenate(
+                #     (aggregatedDict['All_Detection_Lats'], harmonizedDict['Detection_Lats']))})
+                # aggregatedDict.update({'All_Detection_Lons': np.concatenate(
+                #     (aggregatedDict['All_Detection_Lons'], harmonizedDict['Detection_Lons']))})
+
+                # Write the new data to the .csv file:
+                for j in range(len(harmonizedDict['Detection_Times'])):
+                    row_text = [str(harmonizedDict['Detection_Times'][j]).replace(' ', 'T'), str(harmonizedDict['Detection_Alts'][j]),
+                                str(harmonizedDict['Detection_Lats'][j]), str(harmonizedDict['Detection_Lons'][j]),
+                                str(harmonizedDict['D1_Meas'][j]), str(harmonizedDict['D2_Meas'][j])]
+                    writer.writerow(row_text)
 
     # TODO: Visualize the aggregated data in Lunar Geographic Coordinates:
+    # (1): Read in the geolocated detections in the .csv file:
+    df = pd.read_csv(csv_name, sep=' ')
+
+    # (2): Bin detections into the grid (default is 15 degree resolution):
+    step = 15
+    to_bin = lambda x: np.floor(x / step) * step
+    df_detections = df[['All_Detection_Lats', 'All_Detection_Lons', 'D1_Meas', 'D2_Meas']]
+    df_detections['dose'] = df_detections['D1_Meas'] + df_detections['D2_Meas']
+    df_detections['latBin'] = to_bin(df_detections['All_Detection_Lats'])
+    df_detections['lonBin'] = to_bin(df_detections['All_Detection_Lons'])
+    # df_dose = df_detections[['dose', 'latBin', 'lonBin']]
+    # lunarMap = df_dose.groupby(['lonBin', 'latBin']).size().unstack().fillna(0)
+
+    # (3): Display and save the resulting image:
+    points = list(zip(df['All_Detection_Lons'], df['All_Detection_Lats']))
+    values = df_detections['dose'].values * 1e-19 * 100
+    rRes = 15
+    xRange = np.arange(-180, 180+rRes, rRes)
+    yRange = np.arange(-90, 90+rRes, rRes)
+    gridX, gridY = np.meshgrid(xRange, yRange)
+    gridPh = griddata(points, values, (gridX, gridY), method='cubic')
+    gridPhf = np.nan_to_num(gridPh, copy=True, nan=0.0)
+    lunarBkg = np.asarray(Image.open('lroc_color_poles_1k.jpg'))
+    plt.figure()
+    ax = plt.gca()
+    im1 = ax.imshow(lunarBkg, extent=[-180, 180, 90, -90])
+    im2 = ax.imshow(gridPhf, cmap='viridis', interpolation='bicubic', extent=[-180, 180, 90, -90], alpha=0.8)
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes("right", size="5%", pad=0.05)
+    cbar = plt.colorbar(im2, cax=cax)
+    cbar.set_label('Dose (cG)')
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+    ax.set_title('Lunar GCR Dose: '+dateStart+' to '+dateEnd)
+    plt.savefig('figures/Lunar_GCR_Map_'+dateStart+'_'+dateEnd+'.png', dpi=300)
 
     print('Model data available here: '+model_path+'/modelData_'+dateStart+'-'+dateEnd+'.csv')
 
@@ -226,7 +297,10 @@ def harmonizeCrater(primDict, secondDict, fname, override=False):
         Determines whether pre-existing data is downloaded again.
     :return harmonizedDict: dictionary
         Dictionary with keys: 'Time', 'Altitude', 'Latitude', 'Longitude', 'Amplitude', 'Energy', 'LET'
+    :return pre_existing_data: bool
+        Indicates whether data had to be processed or whether it was just read in.
     """
+    # TODO: Modify this function to use location data from the geometry files!
     if os.path.isfile(fname) == False or override == True:
         # Loop through each day and interpolate in location per day:
         secondDict_times_seconds = np.array([((element - secondDict['Time'][0]).seconds) + ((element - secondDict['Time'][0]).microseconds)*(1e-6) for element in secondDict['Time']])
@@ -280,12 +354,14 @@ def harmonizeCrater(primDict, secondDict, fname, override=False):
         with open(fname, 'wb') as handle:
             pickle.dump(harmonizedDict, handle, protocol=pickle.HIGHEST_PROTOCOL)
         print('Data obtained.')
+        pre_existing_data = False
     else:
         with open(fname, 'rb') as handle:
             harmonizedDict = pickle.load(handle)
         print('Loaded existing processed data.')
+        pre_existing_data = True
 
-    return harmonizedDict
+    return harmonizedDict, pre_existing_data
 
 def fitCRaTER(dataFile):
     """
@@ -301,10 +377,10 @@ def fitCRaTER(dataFile):
 #### Execution (examples) ####
 if __name__ == '__main__':
     dateStart = '2012-05-01'
-    dateEnd = '2012-06-01'
+    dateEnd = '2012-05-05'
 
     # Download CRaTER Level 2 data between two dates:
-    # getCRaTER(dateStart, dateEnd)
+    getCRaTER(dateStart, dateEnd)
 
     # Open up a single CRaTER file (primary science data):
     # filename1 = 'CRAT_L2_PRI_2012122_V01.TAB.gz'
